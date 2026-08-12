@@ -1,124 +1,48 @@
 import express from 'express'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import dns from 'node:dns/promises'
 import tls from 'node:tls'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
 
 const app = express()
 
 app.use(express.json())
 
-// ==============================
-// 首页
-// ==============================
-app.get('/', (_req, res) => {
-  res.type('html').send(`
-    <!doctype html>
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Coder Sandbox</title>
-      </head>
-      <body>
-        <h1>Coder Sandbox Proxy</h1>
-        <p>Vercel server is running.</p>
+const VERSION = 'DIAG-V3'
+const HOST = 'ovo.chenqwq.cn'
+const TARGET = `https://${HOST}/`
 
-        <ul>
-          <li><a href="/healthz">/healthz</a></li>
-          <li><a href="/api/test">/api/test</a></li>
-        </ul>
-      </body>
-    </html>
-  `)
-})
-
-// ==============================
-// 健康检查
-// ==============================
-app.get('/healthz', (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    status: 'running',
-    timestamp: new Date().toISOString(),
-  })
-})
-
-// ==============================
-// 将错误转换成 JSON
-// ==============================
-function serializeError(error: unknown) {
+function errorToJson(error: unknown): any {
   if (!(error instanceof Error)) {
     return {
       message: String(error),
     }
   }
 
-  const result: Record<string, unknown> = {
+  const e = error as any
+
+  return {
     name: error.name,
     message: error.message,
-    stack: error.stack,
+    code: e.code ?? null,
+    errno: e.errno ?? null,
+    syscall: e.syscall ?? null,
+    address: e.address ?? null,
+    port: e.port ?? null,
+    cause: e.cause ? errorToJson(e.cause) : null,
   }
-
-  const anyError = error as Error & {
-    code?: string
-    errno?: number
-    syscall?: string
-    address?: string
-    port?: number
-    cause?: unknown
-  }
-
-  if (anyError.code !== undefined) {
-    result.code = anyError.code
-  }
-
-  if (anyError.errno !== undefined) {
-    result.errno = anyError.errno
-  }
-
-  if (anyError.syscall !== undefined) {
-    result.syscall = anyError.syscall
-  }
-
-  if (anyError.address !== undefined) {
-    result.address = anyError.address
-  }
-
-  if (anyError.port !== undefined) {
-    result.port = anyError.port
-  }
-
-  if (anyError.cause !== undefined) {
-    if (anyError.cause instanceof Error) {
-      result.cause = serializeError(anyError.cause)
-    } else {
-      result.cause = String(anyError.cause)
-    }
-  }
-
-  return result
 }
 
-// ==============================
-// 单独测试某个 IP 的 TLS
-// ==============================
-function testTls(
-  hostname: string,
+function testTLS(
   address: string,
   family: 4 | 6
-): Promise<Record<string, unknown>> {
+): Promise<any> {
   return new Promise((resolve) => {
     const start = Date.now()
 
-    let finished = false
+    let done = false
 
-    const finish = (data: Record<string, unknown>) => {
-      if (finished) return
-      finished = true
+    const finish = (data: any) => {
+      if (done) return
+      done = true
 
       resolve({
         address,
@@ -132,25 +56,27 @@ function testTls(
       host: address,
       port: 443,
       family,
-      servername: hostname,
+      servername: HOST,
       rejectUnauthorized: true,
-      timeout: 5000,
     })
 
+    socket.setTimeout(5000)
+
     socket.once('secureConnect', () => {
-      const certificate = socket.getPeerCertificate()
+      const cert = socket.getPeerCertificate()
 
       finish({
         ok: true,
         authorized: socket.authorized,
-        authorization_error: socket.authorizationError ?? null,
+        authorization_error:
+          socket.authorizationError ?? null,
         protocol: socket.getProtocol(),
         cipher: socket.getCipher(),
         certificate: {
-          subject: certificate?.subject ?? null,
-          issuer: certificate?.issuer ?? null,
-          valid_from: certificate?.valid_from ?? null,
-          valid_to: certificate?.valid_to ?? null,
+          subject: cert?.subject ?? null,
+          issuer: cert?.issuer ?? null,
+          valid_from: cert?.valid_from ?? null,
+          valid_to: cert?.valid_to ?? null,
         },
       })
 
@@ -160,7 +86,9 @@ function testTls(
     socket.once('timeout', () => {
       finish({
         ok: false,
-        error: 'TLS timeout',
+        error: {
+          message: 'TLS timeout after 5000ms',
+        },
       })
 
       socket.destroy()
@@ -169,7 +97,7 @@ function testTls(
     socket.once('error', (error) => {
       finish({
         ok: false,
-        error: serializeError(error),
+        error: errorToJson(error),
       })
 
       socket.destroy()
@@ -177,154 +105,206 @@ function testTls(
   })
 }
 
-// ==============================
-// 完整网络诊断
-// ==============================
-app.get('/api/test', async (_req, res) => {
-  const hostname = 'ovo.chenqwq.cn'
-  const targetUrl = `https://${hostname}/`
+// 首页
+app.get('/', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: 'coder-sandbox',
+    version: VERSION,
+    endpoints: {
+      health: '/healthz',
+      test: '/api/test',
+    },
+  })
+})
 
-  const startedAt = Date.now()
-
-  const result: {
-    ok: boolean
-    hostname: string
-    target: string
-    timestamp: string
-    dns: unknown[]
-    tls: unknown[]
-    fetch: unknown
-    elapsed_ms?: number
-    fatal_error?: unknown
-  } = {
-    ok: false,
-    hostname,
-    target: targetUrl,
+// 健康检查
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    version: VERSION,
     timestamp: new Date().toISOString(),
-    dns: [],
+  })
+})
+
+// 完整诊断
+app.get('/api/test', async (_req, res) => {
+  const totalStart = Date.now()
+
+  const result: any = {
+    version: VERSION,
+    ok: false,
+
+    upstream: TARGET,
+
+    timestamp: new Date().toISOString(),
+
+    dns: {
+      ok: false,
+      addresses: [],
+      error: null,
+    },
+
     tls: [],
-    fetch: null,
+
+    fetch: {
+      ok: false,
+    },
   }
 
+  // =========================
+  // DNS
+  // =========================
+  let addresses: {
+    address: string
+    family: number
+  }[] = []
+
   try {
-    // ==============================
-    // DNS 测试
-    // ==============================
-    try {
-      const addresses = await dns.lookup(hostname, {
-        all: true,
-        verbatim: true,
-      })
+    addresses = await dns.lookup(HOST, {
+      all: true,
+      verbatim: true,
+    })
 
-      result.dns = addresses.map((item) => ({
-        address: item.address,
-        family: item.family,
-      }))
+    result.dns = {
+      ok: true,
+      addresses,
+      error: null,
+    }
+  } catch (error) {
+    result.dns = {
+      ok: false,
+      addresses: [],
+      error: errorToJson(error),
+    }
+  }
 
-      // ==============================
-      // 每个解析出来的 IP 单独测试 TLS
-      // ==============================
-      for (const item of addresses) {
-        const tlsResult = await testTls(
-          hostname,
-          item.address,
-          item.family as 4 | 6
-        )
-
-        result.tls.push(tlsResult)
-      }
-    } catch (error) {
-      result.dns = [
-        {
-          ok: false,
-          error: serializeError(error),
-        },
-      ]
+  // =========================
+  // TLS
+  // =========================
+  for (const addr of addresses) {
+    if (addr.family !== 4 && addr.family !== 6) {
+      continue
     }
 
-    // ==============================
-    // 正常 fetch 测试
-    // ==============================
-    const fetchStartedAt = Date.now()
+    try {
+      const tlsResult = await testTLS(
+        addr.address,
+        addr.family as 4 | 6
+      )
+
+      result.tls.push(tlsResult)
+    } catch (error) {
+      result.tls.push({
+        address: addr.address,
+        family: addr.family,
+        ok: false,
+        error: errorToJson(error),
+      })
+    }
+  }
+
+  // =========================
+  // fetch
+  // =========================
+  const fetchStart = Date.now()
+
+  try {
+    const controller = new AbortController()
+
+    const timer = setTimeout(() => {
+      controller.abort()
+    }, 10000)
 
     try {
-      const response = await fetch(targetUrl, {
+      const response = await fetch(TARGET, {
         method: 'GET',
 
         headers: {
-          'User-Agent': 'CoderSandbox-Vercel/1.0',
-          Accept: '*/*',
+          'User-Agent':
+            'Mozilla/5.0 CoderSandbox-Vercel-Diagnostic/3.0',
+
+          Accept:
+            'text/html,application/json,text/plain,*/*',
+
           'Cache-Control': 'no-cache',
         },
 
         redirect: 'manual',
 
-        cache: 'no-store',
-
-        signal: AbortSignal.timeout(10000),
+        signal: controller.signal,
       })
 
       const body = await response.text()
 
       result.fetch = {
         ok: true,
+
         status: response.status,
         status_text: response.statusText,
-        elapsed_ms: Date.now() - fetchStartedAt,
+
+        elapsed_ms:
+          Date.now() - fetchStart,
 
         headers: {
-          server: response.headers.get('server'),
-          date: response.headers.get('date'),
-          location: response.headers.get('location'),
-          content_type: response.headers.get('content-type'),
-          content_length: response.headers.get('content-length'),
-          cf_ray: response.headers.get('cf-ray'),
-          via: response.headers.get('via'),
+          server:
+            response.headers.get('server'),
+
+          date:
+            response.headers.get('date'),
+
+          content_type:
+            response.headers.get('content-type'),
+
+          content_length:
+            response.headers.get('content-length'),
+
+          location:
+            response.headers.get('location'),
+
+          via:
+            response.headers.get('via'),
+
+          cf_ray:
+            response.headers.get('cf-ray'),
+
+          connection:
+            response.headers.get('connection'),
         },
 
-        body: body.slice(0, 5000),
+        body_preview:
+          body.slice(0, 5000),
       }
 
       result.ok = true
-    } catch (error) {
-      result.fetch = {
-        ok: false,
-        elapsed_ms: Date.now() - fetchStartedAt,
-        error: serializeError(error),
-      }
+    } finally {
+      clearTimeout(timer)
     }
-
-    result.elapsed_ms = Date.now() - startedAt
-
-    res.status(200).json(result)
   } catch (error) {
-    result.elapsed_ms = Date.now() - startedAt
-    result.fatal_error = serializeError(error)
+    result.fetch = {
+      ok: false,
 
-    res.status(500).json(result)
+      elapsed_ms:
+        Date.now() - fetchStart,
+
+      error:
+        errorToJson(error),
+    }
   }
+
+  result.elapsed_ms =
+    Date.now() - totalStart
+
+  // 故意始终返回 HTTP 200
+  // 防止 Vercel / 浏览器只显示 500 页面
+  res.status(200).json(result)
 })
 
-// ==============================
-// 原模板 About 页面
-// ==============================
-app.get('/about', (_req, res) => {
-  res.sendFile(
-    path.join(
-      __dirname,
-      '..',
-      'components',
-      'about.htm'
-    )
-  )
-})
-
-// ==============================
 // 404
-// ==============================
 app.use((_req, res) => {
   res.status(404).json({
     ok: false,
+    version: VERSION,
     error: 'Not Found',
   })
 })
