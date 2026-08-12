@@ -6,18 +6,25 @@ const app = express()
 
 app.use(express.json())
 
-const VERSION = 'DIAG-V3'
+const VERSION = 'DIAG-V4'
 const HOST = 'ovo.chenqwq.cn'
 const TARGET = `https://${HOST}/`
 
-function errorToJson(error: unknown): any {
+function errorToJson(error: unknown): Record<string, unknown> {
   if (!(error instanceof Error)) {
     return {
       message: String(error),
     }
   }
 
-  const e = error as any
+  const e = error as Error & {
+    code?: string
+    errno?: number | string
+    syscall?: string
+    address?: string
+    port?: number
+    cause?: unknown
+  }
 
   return {
     name: error.name,
@@ -27,22 +34,27 @@ function errorToJson(error: unknown): any {
     syscall: e.syscall ?? null,
     address: e.address ?? null,
     port: e.port ?? null,
-    cause: e.cause ? errorToJson(e.cause) : null,
+    cause:
+      e.cause !== undefined
+        ? e.cause instanceof Error
+          ? errorToJson(e.cause)
+          : String(e.cause)
+        : null,
   }
 }
 
 function testTLS(
   address: string,
-  family: 4 | 6
-): Promise<any> {
+  family: number
+): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
     const start = Date.now()
 
-    let done = false
+    let finished = false
 
-    const finish = (data: any) => {
-      if (done) return
-      done = true
+    const finish = (data: Record<string, unknown>) => {
+      if (finished) return
+      finished = true
 
       resolve({
         address,
@@ -52,10 +64,11 @@ function testTLS(
       })
     }
 
+    // address 已经是具体 IPv4 / IPv6 地址
+    // 不需要，也不能在 tls.connect ConnectionOptions 里传 family
     const socket = tls.connect({
       host: address,
       port: 443,
-      family,
       servername: HOST,
       rejectUnauthorized: true,
     })
@@ -69,7 +82,9 @@ function testTLS(
         ok: true,
         authorized: socket.authorized,
         authorization_error:
-          socket.authorizationError ?? null,
+          socket.authorizationError instanceof Error
+            ? socket.authorizationError.message
+            : socket.authorizationError ?? null,
         protocol: socket.getProtocol(),
         cipher: socket.getCipher(),
         certificate: {
@@ -105,12 +120,15 @@ function testTLS(
   })
 }
 
+// ==============================
 // 首页
+// ==============================
 app.get('/', (_req, res) => {
   res.status(200).json({
     ok: true,
     service: 'coder-sandbox',
     version: VERSION,
+    upstream: TARGET,
     endpoints: {
       health: '/healthz',
       test: '/api/test',
@@ -118,25 +136,48 @@ app.get('/', (_req, res) => {
   })
 })
 
+// ==============================
 // 健康检查
+// ==============================
 app.get('/healthz', (_req, res) => {
   res.status(200).json({
     ok: true,
+    service: 'coder-sandbox',
     version: VERSION,
     timestamp: new Date().toISOString(),
   })
 })
 
-// 完整诊断
+// ==============================
+// DNS + TLS + FETCH 完整测试
+// ==============================
 app.get('/api/test', async (_req, res) => {
   const totalStart = Date.now()
 
-  const result: any = {
+  const result: {
+    version: string
+    ok: boolean
+    upstream: string
+    timestamp: string
+
+    dns: {
+      ok: boolean
+      addresses: Array<{
+        address: string
+        family: number
+      }>
+      error: Record<string, unknown> | null
+    }
+
+    tls: Array<Record<string, unknown>>
+
+    fetch: Record<string, unknown>
+
+    elapsed_ms?: number
+  } = {
     version: VERSION,
     ok: false,
-
     upstream: TARGET,
-
     timestamp: new Date().toISOString(),
 
     dns: {
@@ -152,19 +193,25 @@ app.get('/api/test', async (_req, res) => {
     },
   }
 
-  // =========================
-  // DNS
-  // =========================
-  let addresses: {
+  // ==============================
+  // 1. DNS
+  // ==============================
+
+  let addresses: Array<{
     address: string
     family: number
-  }[] = []
+  }> = []
 
   try {
-    addresses = await dns.lookup(HOST, {
+    const lookupResult = await dns.lookup(HOST, {
       all: true,
       verbatim: true,
     })
+
+    addresses = lookupResult.map((item) => ({
+      address: item.address,
+      family: item.family,
+    }))
 
     result.dns = {
       ok: true,
@@ -179,107 +226,102 @@ app.get('/api/test', async (_req, res) => {
     }
   }
 
-  // =========================
-  // TLS
-  // =========================
-  for (const addr of addresses) {
-    if (addr.family !== 4 && addr.family !== 6) {
-      continue
-    }
+  // ==============================
+  // 2. 每个 DNS 地址测试 TLS
+  // ==============================
 
+  for (const item of addresses) {
     try {
       const tlsResult = await testTLS(
-        addr.address,
-        addr.family as 4 | 6
+        item.address,
+        item.family
       )
 
       result.tls.push(tlsResult)
     } catch (error) {
       result.tls.push({
-        address: addr.address,
-        family: addr.family,
+        address: item.address,
+        family: item.family,
         ok: false,
         error: errorToJson(error),
       })
     }
   }
 
-  // =========================
-  // fetch
-  // =========================
+  // ==============================
+  // 3. 正常 HTTP Fetch
+  // ==============================
+
   const fetchStart = Date.now()
 
+  const controller = new AbortController()
+
+  const timeout = setTimeout(() => {
+    controller.abort()
+  }, 10000)
+
   try {
-    const controller = new AbortController()
+    const response = await fetch(TARGET, {
+      method: 'GET',
 
-    const timer = setTimeout(() => {
-      controller.abort()
-    }, 10000)
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 CoderSandbox-Vercel-Diagnostic/4.0',
 
-    try {
-      const response = await fetch(TARGET, {
-        method: 'GET',
+        Accept:
+          'text/html,application/json,text/plain,*/*',
 
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 CoderSandbox-Vercel-Diagnostic/3.0',
+        'Cache-Control': 'no-cache',
+      },
 
-          Accept:
-            'text/html,application/json,text/plain,*/*',
+      redirect: 'manual',
 
-          'Cache-Control': 'no-cache',
-        },
+      signal: controller.signal,
+    })
 
-        redirect: 'manual',
+    const body = await response.text()
 
-        signal: controller.signal,
-      })
+    result.fetch = {
+      ok: true,
 
-      const body = await response.text()
+      status: response.status,
 
-      result.fetch = {
-        ok: true,
+      status_text: response.statusText,
 
-        status: response.status,
-        status_text: response.statusText,
+      elapsed_ms:
+        Date.now() - fetchStart,
 
-        elapsed_ms:
-          Date.now() - fetchStart,
+      headers: {
+        server:
+          response.headers.get('server'),
 
-        headers: {
-          server:
-            response.headers.get('server'),
+        date:
+          response.headers.get('date'),
 
-          date:
-            response.headers.get('date'),
+        content_type:
+          response.headers.get('content-type'),
 
-          content_type:
-            response.headers.get('content-type'),
+        content_length:
+          response.headers.get('content-length'),
 
-          content_length:
-            response.headers.get('content-length'),
+        location:
+          response.headers.get('location'),
 
-          location:
-            response.headers.get('location'),
+        via:
+          response.headers.get('via'),
 
-          via:
-            response.headers.get('via'),
+        cf_ray:
+          response.headers.get('cf-ray'),
 
-          cf_ray:
-            response.headers.get('cf-ray'),
+        connection:
+          response.headers.get('connection'),
+      },
 
-          connection:
-            response.headers.get('connection'),
-        },
-
-        body_preview:
-          body.slice(0, 5000),
-      }
-
-      result.ok = true
-    } finally {
-      clearTimeout(timer)
+      body_preview:
+        body.slice(0, 5000),
     }
+
+    result.ok = true
   } catch (error) {
     result.fetch = {
       ok: false,
@@ -290,17 +332,21 @@ app.get('/api/test', async (_req, res) => {
       error:
         errorToJson(error),
     }
+  } finally {
+    clearTimeout(timeout)
   }
 
   result.elapsed_ms =
     Date.now() - totalStart
 
-  // 故意始终返回 HTTP 200
-  // 防止 Vercel / 浏览器只显示 500 页面
+  // 故意永远返回 HTTP 200
+  // 方便直接查看诊断 JSON
   res.status(200).json(result)
 })
 
+// ==============================
 // 404
+// ==============================
 app.use((_req, res) => {
   res.status(404).json({
     ok: false,
